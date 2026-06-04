@@ -49,35 +49,45 @@ STANDARD_SECTIONS = [
 SECTION_ALIASES: Dict[str, List[str]] = {
     "重要提示_目录_释义": [
         "重要提示", "目录", "释义", "重要提示、目录和释义", "重要提示、目录及释义",
+        "重要提示、目录", "重要提示及释义",
     ],
     "公司简介和主要财务指标": [
         "公司简介和主要财务指标", "公司简介", "公司基本情况", "主要财务指标",
         "主要会计数据和财务指标", "公司基本情况和主要财务指标",
+        "公司基本情况及主要会计数据和财务指标",
     ],
     "管理层讨论与分析": [
         "管理层讨论与分析", "经营情况讨论与分析", "董事会报告",
         "报告期内公司所处行业情况", "管理层分析与讨论",
+        "经营情况", "公司业务概要",
     ],
     "公司治理": [
         "公司治理", "公司治理情况", "治理情况",
+        "公司治理、环境和社会", "公司治理、环境和社会责任",
+        "公司治理暨企业管治报告", "公司治理及内部控制",
+        "公司治理、环境与社会责任",
     ],
     "环境和社会责任": [
         "环境和社会责任", "环境与社会责任", "社会责任", "环境保护相关情况",
-        "社会责任情况", "环境、社会及公司治理",
+        "社会责任情况", "环境、社会及公司治理", "环境与公司治理",
+        "社会责任和公司治理", "企业社会责任", "ESG",
     ],
     "重要事项": [
         "重要事项", "重大事项", "其他重要事项",
+        "重要事项及风险提示", "重要事项说明",
     ],
     "股份变动及股东情况": [
         "股份变动及股东情况", "股份变动和股东情况", "股东和实际控制人情况",
         "股份变动、股东情况", "普通股股份变动及股东情况",
+        "股本变动及股东情况", "股东情况",
     ],
     "债券相关情况": [
         "债券相关情况", "公司债券相关情况", "可转换公司债券相关情况",
-        "优先股相关情况", "债券情况",
+        "优先股相关情况", "债券情况", "公司债券", "可转换债券",
     ],
     "财务报告": [
         "财务报告", "审计报告", "财务报表", "财务报表附注", "审计报告及财务报表",
+        "财务会计报告", "财务报告及审计报告", "审计报告及财务报告",
     ],
 }
 
@@ -298,11 +308,37 @@ class TxtSectionSplitter:
 
     def _match_alias(self, line: str) -> Tuple[Optional[str], Optional[str]]:
         compact = self._compact(line)
+        
+        # 首先尝试完整匹配
         for canonical, aliases in SECTION_ALIASES.items():
             for alias in aliases:
                 if self._compact(alias) in compact:
                     return canonical, alias
+        
+        # 检测合并标题：如"公司治理、环境和社会"
+        merged_canonicals = self._detect_merged_title(compact)
+        if merged_canonicals:
+            # 返回第一个匹配到的（主章节）
+            return merged_canonicals[0], line.strip()
+        
         return None, None
+    
+    def _detect_merged_title(self, compact: str) -> List[str]:
+        """检测标题是否包含多个章节别名，返回匹配的canonical列表。"""
+        found = []
+        for canonical, aliases in SECTION_ALIASES.items():
+            for alias in aliases:
+                if self._compact(alias) in compact:
+                    found.append(canonical)
+                    break
+        
+        # 如果找到多个，说明是合并标题
+        if len(found) >= 2:
+            # 按标准顺序排序
+            found.sort(key=lambda c: SECTION_INDEX.get(c, 999))
+            return found
+        
+        return []
 
     def _looks_like_section_heading(self, line: str, canonical: str) -> bool:
         compact = self._compact(line)
@@ -333,6 +369,10 @@ class TxtSectionSplitter:
             r"^第\d+节[ ：:、\-—]*",
             r"^第[一二三四五六七八九十百零〇两]+章[ ：:、\-—]*",
             r"^第\d+章[ ：:、\-—]*",
+            r"^[一二三四五六七八九十百零〇两]+[、\.．\s]+",
+            r"^\d+[、\.．\s]+",
+            r"^\([一二三四五六七八九十百零〇两]+\)[ ：:、\-—]*",
+            r"^\(\d+\)[ ：:、\-—]*",
         ]
         return any(re.match(p, s) for p in patterns)
 
@@ -359,6 +399,51 @@ class TxtSectionSplitter:
     def _compact(self, s: str) -> str:
         return re.sub(r"[\s　:：、，,。\.．\-—_/\\（）()\[\]【】]+", "", s)
 
+    def _is_meaningful_short_section(self, text: str, section_name: str) -> bool:
+        """判断短章节是否有意义，避免丢弃"无债券"等有效声明。"""
+        if not text or len(text.strip()) < 10:
+            return False
+        
+        text_lower = text.strip().lower()
+        
+        # 债券章节：包含"不存在"、"无"、"未发行"等
+        if section_name == "债券相关情况":
+            no_bond_patterns = [
+                "不存在", "无", "未发行", "没有", "不适用", "无相关",
+                "截至报告期末", "报告期内", "公司未", "本公司未",
+            ]
+            if any(p in text_lower for p in no_bond_patterns):
+                return True
+        
+        # 环境和社会责任：包含具体数据或承诺
+        if section_name == "环境和社会责任":
+            env_patterns = [
+                "环保", "排放", "碳", "节能", "减排", "绿色",
+                "污染", "废物", "资源", "可持续", "社会责任",
+                "捐赠", "公益", "扶贫", "乡村振兴",
+            ]
+            if any(p in text_lower for p in env_patterns):
+                return True
+        
+        # 重要事项：包含具体事项
+        if section_name == "重要事项":
+            matter_patterns = [
+                "诉讼", "仲裁", "担保", "质押", "冻结", "处罚",
+                "违规", "关联交易", "收购", "重组", "合并",
+            ]
+            if any(p in text_lower for p in matter_patterns):
+                return True
+        
+        # 其他章节：如果包含实质性内容（非纯标题）
+        lines = [l.strip() for l in text.strip().split('\n') if l.strip()]
+        if len(lines) >= 2:
+            # 至少有一行是正文（长度>20且不是标题格式）
+            for line in lines[1:]:  # 跳过第一行（标题）
+                if len(line) > 20 and not self._has_section_prefix(line):
+                    return True
+        
+        return False
+
     # ---------- selection ----------
 
     def _select_candidates(self, candidates: List[Candidate]) -> List[Candidate]:
@@ -368,9 +453,13 @@ class TxtSectionSplitter:
         - prefer candidates with section prefix and higher confidence
         - enforce canonical order when possible
         - avoid repeated aliases from directory region
+        - deduplicate nearby repeated headings (page headers)
         """
         if not candidates:
             return []
+
+        # Step 1: Deduplicate nearby repeated headings (within 500 chars)
+        candidates = self._deduplicate_nearby(candidates)
 
         grouped: Dict[str, List[Candidate]] = {}
         for c in candidates:
@@ -385,15 +474,14 @@ class TxtSectionSplitter:
             if not options:
                 continue
 
-            # 候选排序：高置信度优先；有章节前缀优先；位置靠后一点优先避免目录。
+            # 候选排序：优先位置靠前的（避免选中正文中的重复标题）；然后按置信度
             options = sorted(
                 options,
                 key=lambda c: (
+                    c.start,  # 优先位置靠前
                     c.confidence,
                     1 if "section_prefix" in c.evidence else 0,
-                    c.start,
                 ),
-                reverse=True,
             )
 
             chosen = None
@@ -413,6 +501,36 @@ class TxtSectionSplitter:
 
         return sorted(selected, key=lambda c: c.start)
 
+    def _deduplicate_nearby(self, candidates: List[Candidate]) -> List[Candidate]:
+        """去重：同一canonical的候选如果在500字符内重复，只保留第一个高置信度的。"""
+        # 按canonical分组
+        by_canonical: Dict[str, List[Candidate]] = {}
+        for c in candidates:
+            by_canonical.setdefault(c.canonical_name, []).append(c)
+        
+        result = []
+        for canonical, group in by_canonical.items():
+            # 按位置排序
+            group.sort(key=lambda c: c.start)
+            
+            kept = []
+            for c in group:
+                # 检查是否与已保留的候选太接近（< 500字符）
+                too_close = False
+                for k in kept:
+                    if abs(c.start - k.start) < 500:
+                        # 太近了，跳过
+                        too_close = True
+                        break
+                
+                if not too_close:
+                    kept.append(c)
+            
+            result.extend(kept)
+        
+        # 重新按位置排序
+        return sorted(result, key=lambda c: c.start)
+
     # ---------- section build ----------
 
     def _build_sections(
@@ -421,6 +539,8 @@ class TxtSectionSplitter:
         lines: List[Tuple[int, int, str]],
         selected: List[Candidate],
     ) -> List[SectionResult]:
+        # 预处理合并标题候选
+        selected = self._split_merged_candidates(selected, text, lines)
         line_no_by_pos = self._line_no_by_start(lines)
         selected_by_name = {c.canonical_name: c for c in selected}
         selected_sorted = sorted(selected, key=lambda c: c.start)
@@ -462,7 +582,17 @@ class TxtSectionSplitter:
             start = c.start
             end = next_start_by_name[canonical]
             content_len = max(0, end - start)
-            status = "matched" if content_len >= self.min_section_chars else "too_short"
+            section_text = text[start:end] if start is not None and end is not None else ""
+            
+            # 检查是否是有意义的短内容（如"无债券"声明）
+            is_meaningful_short = self._is_meaningful_short_section(section_text, canonical)
+            
+            if content_len >= self.min_section_chars:
+                status = "matched"
+            elif is_meaningful_short:
+                status = "matched"  # 保留有意义的短内容
+            else:
+                status = "too_short"
 
             results.append(
                 SectionResult(
@@ -483,6 +613,86 @@ class TxtSectionSplitter:
             )
 
         return results
+
+
+    def _split_merged_candidates(self, candidates: List[Candidate], text: str, lines: List[Tuple[int, int, str]]) -> List[Candidate]:
+        """拆分合并标题候选，如'公司治理、环境和社会'拆为两个候选。"""
+        result = []
+        
+        for c in candidates:
+            merged = self._detect_merged_title(self._compact(c.raw_title))
+            
+            if len(merged) <= 1:
+                result.append(c)
+                continue
+            
+            # 是合并标题，尝试拆分
+            # 找到标题中各章节的位置
+            raw_compact = self._compact(c.raw_title)
+            split_positions = []
+            
+            for canonical in merged:
+                for alias in SECTION_ALIASES.get(canonical, []):
+                    alias_compact = self._compact(alias)
+                    pos = raw_compact.find(alias_compact)
+                    if pos >= 0:
+                        split_positions.append((pos, canonical, alias))
+                        break
+            
+            split_positions.sort()
+            
+            if len(split_positions) >= 2:
+                # 创建拆分后的候选
+                for i, (pos, canonical, alias) in enumerate(split_positions):
+                    # 估算拆分点在文本中的位置
+                    if i == 0:
+                        start = c.start
+                    else:
+                        # 查找对应章节在正文中的实际位置
+                        start = self._find_section_in_text(text, canonical, c.start, 
+                                                           split_positions[i+1][0] if i+1 < len(split_positions) else len(text))
+                    
+                    if i + 1 < len(split_positions):
+                        next_canonical = split_positions[i+1][1]
+                        end_estimate = self._find_section_in_text(text, next_canonical, start, len(text))
+                    else:
+                        end_estimate = len(text)
+                    
+                    new_c = Candidate(
+                        canonical_name=canonical,
+                        raw_title=f"{c.raw_title} [拆分:{alias}]",
+                        line_no=c.line_no,
+                        start=start,
+                        end=min(end_estimate, c.end) if i == 0 else end_estimate,
+                        confidence=c.confidence * 0.9,  # 拆分后置信度略降
+                        evidence=c.evidence + ["merged_split"],
+                    )
+                    result.append(new_c)
+            else:
+                result.append(c)
+        
+        # 去重：同一canonical保留置信度最高的
+        best_by_canonical = {}
+        for c in result:
+            if c.canonical_name not in best_by_canonical or c.confidence > best_by_canonical[c.canonical_name].confidence:
+                best_by_canonical[c.canonical_name] = c
+        
+        return sorted(best_by_canonical.values(), key=lambda c: c.start)
+    
+    def _find_section_in_text(self, text: str, canonical: str, start_pos: int, end_pos: int) -> int:
+        """在文本范围内查找章节的实际起始位置。"""
+        search_text = text[start_pos:end_pos]
+        
+        for alias in SECTION_ALIASES.get(canonical, []):
+            alias_compact = self._compact(alias)
+            # 在范围内搜索
+            for i in range(len(search_text)):
+                check = self._compact(search_text[i:i+len(alias)*3])
+                if alias_compact in check:
+                    return start_pos + i
+        
+        # 找不到，返回中间位置
+        return (start_pos + end_pos) // 2
 
     def _line_no_by_start(self, lines: List[Tuple[int, int, str]]) -> Dict[int, int]:
         return {start: i for i, (start, _end, _line) in enumerate(lines, start=1)}
