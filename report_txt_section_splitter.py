@@ -708,14 +708,11 @@ class TxtSectionSplitter:
     ) -> Dict:
         warnings: List[str] = []
 
-        matched = [s for s in sections if s.status in {"matched", "too_short"}]
+        matched = [s for s in sections if s.status == "matched"]
         missing = [s.canonical_name for s in sections if s.status == "missing"]
-        too_short = [s.canonical_name for s in sections if s.status == "too_short"]
 
         if missing:
             warnings.append(f"缺失标准章节: {missing}")
-        if too_short:
-            warnings.append(f"章节内容过短，可能误切: {too_short}")
         if not selected:
             warnings.append("未识别到任何标准章节")
         if len(text) < 5000:
@@ -743,7 +740,7 @@ class TxtSectionSplitter:
                 "missing_section_count": len(missing),
             },
             "missing_sections": missing,
-            "too_short_sections": too_short,
+            "too_short_sections": [],  # 切分器不做价值判断，此字段保留为空
         }
 
 
