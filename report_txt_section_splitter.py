@@ -89,6 +89,16 @@ SECTION_ALIASES: Dict[str, List[str]] = {
         "财务报告", "审计报告", "财务报表", "财务报表附注", "审计报告及财务报表",
         "财务会计报告", "财务报告及审计报告", "审计报告及财务报告",
     ],
+    "_财务报告_审计报告": [
+        "审计报告", "审计意见",
+    ],
+    "_财务报告_财务报表": [
+        "合并资产负债表", "合并利润表", "合并现金流量表", "合并所有者权益变动表",
+        "资产负债表", "利润表", "现金流量表",
+    ],
+    "_财务报告_附注": [
+        "财务报表附注", "附注",
+    ],
 }
 
 SECTION_INDEX = {name: i for i, name in enumerate(STANDARD_SECTIONS)}
@@ -230,6 +240,9 @@ class TxtSectionSplitter:
         text = text.replace("\u3000", " ")
         text = re.sub(r"[\t ]+", " ", text)
         text = re.sub(r"\n{4,}", "\n\n\n", text)
+        # 清洗页码前缀：如 "3第一节" -> "第一节", "99第六节" -> "第六节"
+        text = re.sub(r'(?m)^\d+(第[一二三四五六七八九十]+节)', r'\1', text)
+        text = re.sub(r'(?m)^\d+(第[一二三四五六七八九十]+章)', r'\1', text)
         return text.strip() + "\n"
 
     def _line_index(self, text: str) -> List[Tuple[int, int, str]]:
@@ -308,37 +321,11 @@ class TxtSectionSplitter:
 
     def _match_alias(self, line: str) -> Tuple[Optional[str], Optional[str]]:
         compact = self._compact(line)
-        
-        # 首先尝试完整匹配
         for canonical, aliases in SECTION_ALIASES.items():
             for alias in aliases:
                 if self._compact(alias) in compact:
                     return canonical, alias
-        
-        # 检测合并标题：如"公司治理、环境和社会"
-        merged_canonicals = self._detect_merged_title(compact)
-        if merged_canonicals:
-            # 返回第一个匹配到的（主章节）
-            return merged_canonicals[0], line.strip()
-        
         return None, None
-    
-    def _detect_merged_title(self, compact: str) -> List[str]:
-        """检测标题是否包含多个章节别名，返回匹配的canonical列表。"""
-        found = []
-        for canonical, aliases in SECTION_ALIASES.items():
-            for alias in aliases:
-                if self._compact(alias) in compact:
-                    found.append(canonical)
-                    break
-        
-        # 如果找到多个，说明是合并标题
-        if len(found) >= 2:
-            # 按标准顺序排序
-            found.sort(key=lambda c: SECTION_INDEX.get(c, 999))
-            return found
-        
-        return []
 
     def _looks_like_section_heading(self, line: str, canonical: str) -> bool:
         compact = self._compact(line)
@@ -539,8 +526,6 @@ class TxtSectionSplitter:
         lines: List[Tuple[int, int, str]],
         selected: List[Candidate],
     ) -> List[SectionResult]:
-        # 预处理合并标题候选
-        selected = self._split_merged_candidates(selected, text, lines)
         line_no_by_pos = self._line_no_by_start(lines)
         selected_by_name = {c.canonical_name: c for c in selected}
         selected_sorted = sorted(selected, key=lambda c: c.start)
