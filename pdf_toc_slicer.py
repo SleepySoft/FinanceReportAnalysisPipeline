@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
 
+from report_type_detector import ReportTypeDetector
+
 
 @dataclass
 class TextBlock:
@@ -974,10 +976,24 @@ def build_page_mapping(extractor: PDFStructureExtractor) -> Dict[int, int]:
     return mapping
 
 
-def analyze_pdf_structure(pdf_path: str) -> Dict:
+def analyze_pdf_structure(pdf_path: str, skip_summary: bool = True) -> Dict:
     """
     分析PDF结构的主函数
     """
+    from dataclasses import asdict
+    
+    # 0. 摘要检测
+    if skip_summary:
+        detector = ReportTypeDetector()
+        detection = detector.detect_from_pdf_file(Path(pdf_path))
+        if detection.is_summary:
+            detector.record_skip(detection, Path(pdf_path))
+            return {
+                "error": "检测到年度报告摘要，已跳过",
+                "doc_type": "summary",
+                **asdict(detection)
+            }
+    
     extractor = PDFStructureExtractor(pdf_path)
     
     result = {
@@ -1055,6 +1071,16 @@ def main():
     print("=" * 60)
     print(f"分析: {pdf_path}")
     print("=" * 60)
+    
+    # 0. 摘要检测
+    detector = ReportTypeDetector()
+    detection = detector.detect_from_pdf_file(Path(pdf_path))
+    if detection.is_summary:
+        detector.record_skip(detection, Path(pdf_path))
+        print(f"\n🚫 检测到年度报告摘要，已跳过处理。")
+        print(f"   置信度: {detection.confidence}")
+        print(f"   原因: {'; '.join(detection.reasons)}")
+        sys.exit(0)
     
     extractor = PDFStructureExtractor(pdf_path)
     

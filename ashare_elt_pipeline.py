@@ -17,6 +17,8 @@ from collections import Counter
 import ollama
 from pydantic import BaseModel, ValidationError
 
+from report_type_detector import ReportTypeDetector, DetectionResult
+
 # ==========================================
 # 0. 全局配置与价值体系
 # ==========================================
@@ -935,12 +937,16 @@ class L2FinancialSplitter:
 # 5. 顶层流水线封装 (Facade)
 # ==========================================
 class AShareReportPipeline:
-    def __init__(self, input_path: str, output_dir: str):
+    def __init__(self, input_path: str, output_dir: str, skip_summary: bool = True):
         self.input_path = Path(input_path)
         self.output_dir = Path(output_dir)
         self.doc_id = self.input_path.stem
         self.cleaned_text = None
         self.manifest = None
+        self.skip_summary = skip_summary
+        self.detector = ReportTypeDetector(
+            skip_log_path=self.output_dir / "skipped_summaries.json"
+        )
 
     def execute_stage1(self) -> 'AShareReportPipeline':
         """执行 Stage 1: 文本清洗"""
@@ -948,6 +954,17 @@ class AShareReportPipeline:
         logger.info("⚡ [Stage 1] 执行文本清洗...")
         
         text = self.input_path.read_text(encoding="utf-8", errors="ignore")
+        
+        # 摘要检测：如果是年度报告摘要，直接跳过
+        if self.skip_summary:
+            detection = self.detector.detect_from_text(text, doc_id=self.doc_id)
+            if detection.is_summary:
+                self.detector.record_skip(detection, self.input_path)
+                raise ValueError(
+                    f"🚫 检测到年度报告摘要，已跳过处理: {self.input_path.name} "
+                    f"(置信度: {detection.confidence}, 原因: {'; '.join(detection.reasons)})"
+                )
+        
         cleaner = Stage1TextCleaner(output_dir=self.output_dir)
         self.cleaned_text, clean_stats = cleaner.clean(text, self.doc_id)
         
