@@ -101,6 +101,7 @@ class TxtReportSplitter:
         ]),
         SectionDef("关联方及关联交易", [
             "关联方及关联交易",
+            '关联方关系及交易'
         ]),
         SectionDef("重要交易和事项", [
             "重要交易和事项",
@@ -120,7 +121,23 @@ class TxtReportSplitter:
     SUBSECTION_MERGE_DISTANCE = 800
 
     # 通用节编号前缀正则（中文数字或阿拉伯数字）
-    SECTION_PREFIX_RE = r'第[一二三四五六七八九十0-9]+节\s*'
+    SECTION_PREFIX_RE = r'第[一二三四五六七八九十0-9]+(?:节|章)\s*'
+
+    # 章节编号映射（个位预留，间隔为10）
+    SECTION_ORDER_MAP = {
+        "前言及重要提示": 10,
+        "重要提示、目录和释义": 20,
+        "公司简介和主要财务指标": 30,
+        "管理层讨论与分析": 40,
+        "公司治理、环境和社会": 50,
+        "重要事项": 60,
+        "股份变动及股东情况": 70,
+        "债券相关情况": 80,
+        "财务报告": 90,
+        "审计报告": 100,
+        "关联方及关联交易": 110,
+        "重要交易和事项": 120,
+    }
 
     def __init__(self):
         self._compile_patterns()
@@ -251,8 +268,9 @@ class TxtReportSplitter:
                 doc_dir = output_dir / doc_id
                 doc_dir.mkdir(parents=True, exist_ok=True)
                 for sec_name, sec_text in result.sections.items():
+                    order = self.SECTION_ORDER_MAP.get(sec_name, 999)
                     safe_name = sec_name.replace('、', '_').replace('/', '_')
-                    out_path = doc_dir / f"{safe_name}.txt"
+                    out_path = doc_dir / f"{order:03d}_{safe_name}.txt"
                     out_path.write_text(sec_text, encoding='utf-8')
 
                 meta_path = doc_dir / "_metadata.json"
@@ -270,8 +288,9 @@ class TxtReportSplitter:
                 # 扁平输出：所有文件放在同一目录
                 output_dir.mkdir(parents=True, exist_ok=True)
                 for sec_name, sec_text in result.sections.items():
+                    order = self.SECTION_ORDER_MAP.get(sec_name, 999)
                     safe_name = sec_name.replace('、', '_').replace('/', '_')
-                    out_path = output_dir / f"{doc_id}_{safe_name}.txt"
+                    out_path = output_dir / f"{doc_id}_{order:03d}_{safe_name}.txt"
                     out_path.write_text(sec_text, encoding='utf-8')
 
                 meta_path = output_dir / f"{doc_id}_metadata.json"
@@ -379,12 +398,12 @@ class TxtReportSplitter:
 
         # 5. 判断实际匹配到的文本是否带节编号
         matched_text = line[match_start:match_end]
-        has_section_prefix = bool(re.search(r'第[一二三四五六七八九十0-9]+节', matched_text))
+        has_section_prefix = bool(re.search(r'第[一二三四五六七八九十0-9]+(?:节|章)', matched_text))
 
         if not has_section_prefix:
             # 弱匹配需要更严格
             if before:
-                if not re.match(r'^(?:第[一二三四五六七八九十]+节|[（(]?[一二三四五六七八九十]+[)）]?\s*[、.．]?|\d+\s*[、.．]?)?$', before):
+                if not re.match(r'^(?:第[一二三四五六七八九十]+(?:节|章)|[（(]?[一二三四五六七八九十]+[)）]?\s*[、.．]?|\d+\s*[、.．]?)?$', before):
                     if len(before) <= 20 and re.search(r'[\u4e00-\u9fa5]{3,}', before):
                         return False
 
@@ -459,7 +478,7 @@ class TxtReportSplitter:
 
         pre_content = text[:matches[0].start]
         if pre_content.strip():
-            sections["_PREAMBLE"] = pre_content
+            sections["前言及重要提示"] = pre_content
 
         for i, match in enumerate(matches):
             start = match.start
