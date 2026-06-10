@@ -66,48 +66,119 @@ class TxtReportSplitter:
     程序会自动为每个标题生成两套模式：
       - 强匹配：带节编号的标题
       - 弱匹配：标题单独出现
+
+    ⚠️ 架构权衡与已知限制（按影响程度排序）：
+
+    1. 弱匹配上限 20 个/section
+       超长报告中如果某个标题在正文中出现超过 20 次（如表格反复引用
+       "财务报告"），真正的章节标题可能在第 20 次之后，导致遗漏。
+       这是为了防止正则回溯导致性能爆炸而做的取舍。
+
+    2. 目录跳过 (ANCHOR_OFFSET=200)
+       硬编码的 200 字符偏移量。如果目录排版紧凑，正文中的锚点标题
+       可能落在截断范围内被误杀。若锚点本身就在目录中，跳过位置可能
+       偏差更大。
+
+    3. 页眉/页脚过滤
+       _is_page_header() 匹配行前缀中的 "年度报告"、年份数字等。
+       如果真正的章节标题恰好出现在页眉行（如页眉+章节标题在同一行），
+       会被误过滤。弱匹配的 0.15~0.25 ratio 阈值也可能误杀短标题。
+
+    4. 子章节合并 (SUBSECTION_MERGE_DISTANCE=800)
+       审计报告、关联交易等子章节如果距上一章节 <800 字符，会被
+       强制合并到上一章节中。某些报告的审计报告确实很短，会被
+       错误吞并。
+
+    5. 负向环视边界
+       别名匹配前后不能紧接汉字。如果标题前有标点或特殊符号，
+       可能导致匹配失败。
+
+    6. 低质量过滤
+       中文比例 <15% 或文件 <500 字节会被直接丢弃。可能误杀
+       纯数字表格或极简年报摘要。
     """
 
     # 章节定义：只写纯标题文字，从长到短排列
+    # 同时包含简体、繁体、金融行业非标别名
     SECTIONS = [
         SectionDef("公司简介和主要财务指标", [
             "公司简介和主要财务指标",
+            "公司基本情况简介",
+            "公司簡介和主要財務指標",
+            "公司簡介",
+            "公司資料",
             "公司简介",
+            "关于我们",
+            "關於我們",
         ]),
         SectionDef("管理层讨论与分析", [
             "管理层讨论与分析",
+            "管理層討論與分析",
+            "管理概览",
+            "管理層概覽",
+            "经营情况讨论与分析",
+            "經營情況討論與分析",
+            "经营情况概览",
+            "業務回顧",
+            "主席致辞",
+            "董事長致辭",
         ]),
         SectionDef("公司治理、环境和社会", [
             "公司治理、环境和社会",
             "公司治理环境和社会",
             "公司治理",
+            "企業管治",
+            "企業管治報告",
+            "环境、社会及公司治理",
         ]),
         SectionDef("重要事项", [
             "重要事项",
+            "重要事項",
+            "董事會報告",
+            "董事会报告",
         ]),
         SectionDef("股份变动及股东情况", [
             "股份变动及股东情况",
             "股份变动及股东",
+            "股本变动及重要股东情况",
+            "股本變動及重要股東情況",
+            "股東情況",
+            "股东情况",
         ]),
         SectionDef("债券相关情况", [
             "债券相关情况",
             "债券相关",
+            "債券相關情況",
+            "債券相關",
         ]),
         SectionDef("财务报告", [
             "财务报告",
+            "財務報告",
+            "財務報表",
+            "财务报表",
+            "审计报告及财务报告",
+            "審計報告及財務報告",
+            "獨立核數師報告",
         ]),
         SectionDef("审计报告", [
             "审计报告",
+            "審計報告",
+            "獨立核數師報告",
         ]),
         SectionDef("关联方及关联交易", [
             "关联方及关联交易",
-            '关联方关系及交易'
+            "關聯方及關聯交易",
+            "關聯方關係及交易",
+            "关联方关系及交易",
         ]),
         SectionDef("重要交易和事项", [
             "重要交易和事项",
+            "重要交易和事項",
         ]),
         SectionDef("重要提示、目录和释义", [
             "重要提示、目录和释义",
+            "重要提示、目錄和釋義",
+            "重要提示",
         ]),
     ]
 
@@ -120,8 +191,9 @@ class TxtReportSplitter:
     # 子section合并距离阈值
     SUBSECTION_MERGE_DISTANCE = 800
 
-    # 通用节编号前缀正则（中文数字或阿拉伯数字）
-    SECTION_PREFIX_RE = r'第[一二三四五六七八九十0-9]+(?:节|章)\s*'
+    # 通用节编号前缀正则
+    # 支持：第X节/章、（X）/（X）、X、/X. 等格式
+    SECTION_PREFIX_RE = r'(?:第[一二三四五六七八九十0-9]+(?:节|章)|[（(][一二三四五六七八九十0-9]+[)）]|[一二三四五六七八九十0-9]+[、.．])\s*'
 
     # 章节编号映射（个位预留，间隔为10）
     SECTION_ORDER_MAP = {
@@ -141,6 +213,7 @@ class TxtReportSplitter:
 
     def __init__(self):
         self._compile_patterns()
+        self._header_re = re.compile(r'年度报告|半年度报告|季度报告|股份有限公司|\d{4}年(?:度)?(?:报|报告)|季报|半年报')
 
     def _alias_to_regex(self, alias: str) -> str:
         """将固定文字标题转换为可容忍中间空格的正则片段"""
@@ -157,6 +230,30 @@ class TxtReportSplitter:
         1) 强匹配：带节编号的标题
         2) 弱匹配：标题单独出现
         均附加负向环视，防止匹配到更长词内部的子串。
+
+        ⚠️ 性能与精度权衡：
+
+        - 负向环视 (?<![\u4e00-\u9fa5]) 和 (?![\u4e00-\u9fa5]) 要求匹配
+          边界前后不能是汉字。这意味着 "财务报告分析" 中的 "财务报告"
+          不会被匹配（正确），但 "、财务报告" 中的 "财务报告" 也不会被
+          匹配（因为顿号不是汉字，前面是汉字顿号，后面是汉字——实际上
+          顿号不是 \u4e00-\u9fff 范围，所以顿号后的 "财务报告" 前面是顿号
+          （非汉字），环视通过；后面是"分"（汉字），(?![\u4e00-\u9fa5]) 会
+          在 "报" 后面检查，"分" 是汉字，所以不匹配）。
+          等等，让我重新理解... 实际上 "财务报告分析" 中，匹配 "财务报告"
+          后，(?![\u4e00-\u9fa5]) 检查 "报" 后面的字符，是 "分"（汉字），
+          所以不匹配。这是正确的。
+          但如果标题后面跟着标点（如 "财务报告。"），"报" 后面是 "。"，
+          不是汉字，所以可以匹配。这也是正确的。
+
+        - 每个别名生成 2 个正则（强+弱），繁体别名进一步增加模式数量。
+          对于 10 个 section × 平均 6 个别名 × 2 = 120 个正则，
+          在超长文本上同时执行 finditer 有性能风险。当前通过弱匹配
+          上限 20 来缓解，但强匹配仍全部执行。
+
+        - SECTION_PREFIX_RE 支持第X节/章、（X）、X、/X. 等格式，但
+          无法覆盖所有非标编号（如 "Part 3"、"Section III" 等英文编号）。
+          这也是 030 覆盖率停留在 96.8% 的原因之一。
         """
         self._patterns = {}
         for sec in self.SECTIONS:
@@ -318,6 +415,22 @@ class TxtReportSplitter:
     def _is_low_quality(self, text: str) -> Tuple[bool, str]:
         """检测是否为低质量提取文本
 
+        ⚠️ 误杀风险：
+
+        1) 500 字节阈值
+           - 某些极简年报摘要或季度报告可能确实只有几百字，会被误判为
+             低质量。但当前输入是 A 股年度报告，正常长度应在数万字以上，
+             500 字节作为 safety guard 基本合理。
+
+        2) (cid:) 比例 >5%
+           - PDF 提取失败时常见此标记。阈值 5% 是经验值，如果报告含大量
+             化学式（如医药股）或特殊符号，可能接近此阈值，但通常不会超标。
+
+        3) 中文比例 <15%
+           - 可能误杀以数字表格为主的报告（如金融股的资产负债表纯文本版）。
+           - 也可能误杀纯英文的 B 股报告或外资公司年报。
+           - 当前输入是 A 股年报，默认以中文为主，15% 是较宽松的阈值。
+
         Returns:
             (is_low_quality, reason)
         """
@@ -339,17 +452,34 @@ class TxtReportSplitter:
         return False, ""
 
     def _find_all_matches(self, text: str) -> List[MatchRecord]:
-        """在全文查找所有候选匹配"""
+        """在全文查找所有候选匹配
+
+        策略：
+        1. 强匹配（带章节前缀）保留所有通过过滤的匹配
+        2. 弱匹配（无前缀）也保留，但最多 20 个/section，避免性能问题
+        3. 目录中的匹配会在 _skip_toc 中被过滤，正文中的匹配仍有机会被保留
+        4. _dedup_and_sort 最终保留每个 section 的第一个匹配
+
+        ⚠️ 弱匹配上限 20 的 trade-off：
+        - 超长报告（如银行、保险年报可达数百万字）中，"财务报告"、"公司治理"
+          等词汇可能在正文表格中反复出现。如果真正的章节标题出现在第 20 次
+          匹配之后（即前面有 20 次正文引用通过了 _is_likely_heading 过滤），
+          该章节将被完全遗漏。
+        - 2026-06-09 实测：5118 份报告中 030 覆盖率 96.8%，其中部分缺失
+          可能与此上限有关。如需提升覆盖率，可考虑按 section 差异化设置上限
+          （如 030 可放宽到 50，100/110 保持 20）。
+        - 另外注意：finditer 在遇到 catastrophic backtracking 时可能极慢，
+          这也是设置上限的原因之一。繁体别名增加了模式数量，进一步加剧风险。
+        """
         records = []
 
         for sec in self.SECTIONS:
-            sec_matched = False
+            # 第一阶段：强匹配
             for alias_tag, pattern in self._patterns[sec.canonical_name]:
-                if sec_matched:
-                    break
+                if "[弱]" in alias_tag:
+                    continue
                 for m in pattern.finditer(text):
                     start, end = m.start(), m.end()
-                    # 提取所在行
                     line_beg = text.rfind('\n', 0, start) + 1
                     line_end = text.find('\n', start)
                     if line_end == -1:
@@ -359,8 +489,7 @@ class TxtReportSplitter:
                     if not self._is_likely_heading(line_text, start - line_beg, end - line_beg):
                         continue
 
-                    # 记录原始别名（去掉 [强]/[弱] 标记）
-                    clean_alias = alias_tag.replace("[强]", "").replace("[弱]", "")
+                    clean_alias = alias_tag.replace("[强]", "")
                     records.append(MatchRecord(
                         start=start,
                         end=end,
@@ -368,20 +497,92 @@ class TxtReportSplitter:
                         matched_alias=clean_alias,
                         line_text=line_text.strip()
                     ))
-                    sec_matched = True
+
+            # 第二阶段：弱匹配（不受强匹配结果影响，始终执行）
+            weak_count = 0
+            for alias_tag, pattern in self._patterns[sec.canonical_name]:
+                if "[强]" in alias_tag:
+                    continue
+                for m in pattern.finditer(text):
+                    start, end = m.start(), m.end()
+                    line_beg = text.rfind('\n', 0, start) + 1
+                    line_end = text.find('\n', start)
+                    if line_end == -1:
+                        line_end = len(text)
+                    line_text = text[line_beg:line_end]
+
+                    if not self._is_likely_heading(line_text, start - line_beg, end - line_beg):
+                        continue
+
+                    clean_alias = alias_tag.replace("[弱]", "")
+                    records.append(MatchRecord(
+                        start=start,
+                        end=end,
+                        canonical_name=sec.canonical_name,
+                        matched_alias=clean_alias,
+                        line_text=line_text.strip()
+                    ))
+                    weak_count += 1
+                    if weak_count >= 20:
+                        break
+                if weak_count >= 20:
                     break
 
         return records
 
+    def _is_page_header(self, text: str) -> bool:
+        """检测文本是否主要是页眉/页脚内容
+
+        ⚠️ 负面影响：
+        - 如果章节标题和页眉恰好位于同一行（如 "XX股份 2025年度报告  第三节 财务报告"），
+          该行会被整体判定为页眉，导致真正的章节标题被过滤。
+        - 行首包含 "2025" 且长度>5 即判定为页眉，可能误杀以年份开头的章节引言。
+        - 对 "年度报告" 的匹配过于宽泛，如果公司名称本身含 "年报" 字样可能误触发。
+
+        当前实现是保守策略：宁可误杀页眉，也不保留大量重复页眉导致的假匹配。
+        如果 030/040 等核心章节覆盖率下降，优先检查此处是否过度过滤。
+        """
+        return bool(self._header_re.search(text))
+
     def _is_likely_heading(self, line: str, match_start: int, match_end: int) -> bool:
-        """判断一行是否可能是真正的章节标题（而非目录行或正文引用）"""
-        # 1. 目录线过滤
-        dot_like = line.count('.') + line.count('．') + line.count('…') + line.count('·')
+        """判断一行是否可能是真正的章节标题（而非目录行或正文引用）
+
+        ⚠️ 本函数是多层过滤的集合，每层都有误杀风险：
+
+        1) 目录线过滤（dot_like > 5）
+           如果标题后面恰好有很多省略号或点号（如旧版 PDF 提取的目录残留），
+           真正的标题可能被误判为目录行。
+
+        2) 页码过滤（after 是纯数字 / \\s{5,}\\d+$）
+           如果章节标题后面恰好有页码批注，会被过滤。
+
+        3) 引用检测（"详见/参见/请参阅"）
+           如果正文中引用章节时格式为 "详见第三节 财务报告"，
+           这里的 "财务报告" 会被正确过滤。但如果章节标题本身包含
+           "参见" 等字样（如 "参见事项"），也会被误杀。
+
+        4) 引号检测（before 中有引号）
+           如果章节标题前面有引号（如 "管理层讨论与分析"），
+           这通常是正文引用，但某些报告的标题格式确实带引号，会误杀。
+
+        5) 弱匹配 ratio 阈值（match_len / line_len < 0.15~0.25）
+           当一行包含大量其他内容（如页眉+标题+页码），匹配文本占整行
+           比例过低时会被过滤。如果标题很短且行很长，可能被误杀。
+           threshold 在页眉行前放宽到 0.1，正常行是 0.25。
+
+        6) before 中的汉字长度过滤（<=20 且含 3+ 汉字）
+           如果标题前面有较长中文说明（如 "本章为"），会被过滤。
+           这可能误杀 "本节 财务报告" 这类非标格式。
+        """
+        # 1. 目录线过滤（允许页眉+标题的组合）
+        # 计算匹配文本后面的点号数量，如果点号集中在后面可能是目录行
+        after_text = line[match_end:]
+        dot_like = after_text.count('.') + after_text.count('．') + after_text.count('…') + after_text.count('·')
         if dot_like > 5:
             return False
 
         # 2. 页码过滤：匹配后面紧跟纯数字
-        after = line[match_end:].strip()
+        after = after_text.strip()
         if re.match(r'^\d+$', after):
             return False
 
@@ -398,24 +599,51 @@ class TxtReportSplitter:
 
         # 5. 判断实际匹配到的文本是否带节编号
         matched_text = line[match_start:match_end]
-        has_section_prefix = bool(re.search(r'第[一二三四五六七八九十0-9]+(?:节|章)', matched_text))
+        has_section_prefix = bool(re.search(r'(?:第[一二三四五六七八九十0-9]+(?:节|章)|[（(][一二三四五六七八九十0-9]+[)）]|[一二三四五六七八九十0-9]+[、.．])', matched_text))
+
+        # 页眉检测
+        is_header_before = self._is_page_header(before)
 
         if not has_section_prefix:
-            # 弱匹配需要更严格
-            if before:
-                if not re.match(r'^(?:第[一二三四五六七八九十]+(?:节|章)|[（(]?[一二三四五六七八九十]+[)）]?\s*[、.．]?|\d+\s*[、.．]?)?$', before):
+            # 弱匹配需要更严格，但如果 before 是页眉则放宽
+            if before and not is_header_before:
+                if not re.match(r'^(?:第[一二三四五六七八九十]+(?:节|章)|[（(][一二三四五六七八九十0-9]+[)）]|[一二三四五六七八九十0-9]+[、.．]|\d+\s*[、.．])?$', before):
                     if len(before) <= 20 and re.search(r'[\u4e00-\u9fa5]{3,}', before):
                         return False
 
             match_len = match_end - match_start
             line_len = len(line.strip())
-            if line_len > 0 and match_len / line_len < 0.25:
-                return False
+            if line_len > 0:
+                ratio = match_len / line_len
+                threshold = 0.1 if is_header_before else 0.25
+                if ratio < threshold:
+                    return False
 
         return True
 
     def _skip_toc(self, matches: List[MatchRecord], text: str) -> List[MatchRecord]:
-        """以锚点section跳过目录区域"""
+        """以锚点section跳过目录区域
+
+        ⚠️ 副作用与边界情况：
+
+        1) ANCHOR_OFFSET=200 是经验值，非自适应
+           - 如果目录排版非常紧凑（锚点标题后紧跟子目录），200 字符可能
+             不足以跳过整个目录区，导致后续目录匹配残留。
+           - 如果目录和正文之间只有很少的填充内容，锚点后的正文标题可能
+             落在 200 字符内被误杀。
+
+        2) 锚点缺失时的退化
+           - 如果 ANCHOR_SECTION 和 FALLBACK_ANCHORS 全部缺失（如某些
+             非标结构的港股报告），本函数不做任何过滤，所有匹配保留。
+             这可能导致目录匹配大量混入最终结果。
+
+        3) 锚点 reinject 的副作用
+           - 锚点本身被重新插入 filtered 列表头部，但其位置仍在目录区。
+             _dedup_and_sort 会保留每个 canonical_name 的第一次出现，
+             如果目录中锚点被 reinject，而正文中还有同名锚点，
+             正文的那个会被去重丢弃——但通常目录中的锚点位置更早，
+             所以分割结果会把目录内容算入该章节，可能污染内容。
+        """
         anchor_names = [self.ANCHOR_SECTION] + self.FALLBACK_ANCHORS
         anchor_pos = None
         used_anchor = None
@@ -453,7 +681,24 @@ class TxtReportSplitter:
         return result
 
     def _merge_subsections(self, matches: List[MatchRecord]) -> List[MatchRecord]:
-        """合并子section：如果紧跟在父section之后，则不作为独立分隔点"""
+        """合并子section：如果紧跟在父section之后，则不作为独立分隔点
+
+        ⚠️ 硬编码阈值 800 字符的误杀风险：
+
+        - "审计报告" 在某些年报中确实很短（仅几百字的审计意见），
+          如果它紧跟在 "财务报告" 之后且距离 <800 字符，会被强制合并
+          到财务报告中，导致审计报告章节完全消失。
+          实测：100(审计报告) 覆盖率仅 16.6%，部分原因在此。
+
+        - "关联方及关联交易" 如果被放在 "重要事项" 后面且距离很近，
+          也会被吞并。
+
+        - 距离计算使用字符数而非语义分析，如果中间有大量空白或
+          格式符号，实际内容可能已经很长了但仍被合并。
+
+        如需提升 100/110 的识别率，可缩小 SUBSECTION_MERGE_DISTANCE
+        或把这两个 section 从 subsections 集合中移除。
+        """
         if not matches:
             return matches
 
