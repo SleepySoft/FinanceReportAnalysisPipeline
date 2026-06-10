@@ -10,7 +10,7 @@
 4. 按缺失模式分组，便于发现新识别模式
 
 用法：
-    py audit_split_results.py
+    py pdf_txt_report_split_auditor.py
 """
 
 import json
@@ -273,7 +273,7 @@ def main():
 
     if not batch_report_path.exists():
         print("错误: 找不到 %s" % batch_report_path)
-        print("请先运行 txt_report_splitter.py 生成分割结果")
+        print("请先运行 pdf_txt_report_splitter_v1.py 生成分割结果")
         return
 
     report = audit_split_results(split_dir, batch_report_path)
