@@ -5,20 +5,25 @@ TXT财报分割器
 按照 01.pdf_text_splitter_design.md 设计文档实现
 
 核心思路：
-1. 每个 section 只定义“固定文字”标题别名（如 "财务报告"）
-2. 由程序自动生成带可选节编号前缀的正则模式：
-   (?:第[一二三四五六七八九十0-9]+节\s*)?财\s*务\s*报\s*告
+1. 每个 section 只定义"固定文字"标题别名（如 "财务报告"）
+2. 由程序自动生成带可选节编号前缀的正则模式
 3. 这样无需枚举 "第八节/第九节/第十节..." 等所有节编号组合
 """
 
 import json
 import re
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import logging
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
 logger = logging.getLogger(__name__)
 
 
@@ -59,8 +64,8 @@ class TxtReportSplitter:
 
     别名定义规则：只写标题文字本身，不写 "第X节" 前缀。
     程序会自动为每个标题生成两套模式：
-      - 强匹配：(?:第[一二三四五六七八九十0-9]+节\s*)标题
-      - 弱匹配：标题（单独出现）
+      - 强匹配：带节编号的标题
+      - 弱匹配：标题单独出现
     """
 
     # 章节定义：只写纯标题文字，从长到短排列
@@ -132,8 +137,8 @@ class TxtReportSplitter:
         """预编译正则模式
 
         对每个别名生成两种模式：
-        1) 强匹配：(?:第...节\s*)标题  — 带节编号
-        2) 弱匹配：标题                — 单独出现
+        1) 强匹配：带节编号的标题
+        2) 弱匹配：标题单独出现
         均附加负向环视，防止匹配到更长词内部的子串。
         """
         self._patterns = {}
@@ -169,6 +174,15 @@ class TxtReportSplitter:
                 doc_id=doc_id,
                 status="ignored_summary",
                 metadata={"reason": "检测到年度报告摘要，不属于分析范围"}
+            )
+
+        # 1b) 低质量检测
+        is_lq, lq_reason = self._is_low_quality(text)
+        if is_lq:
+            return SplitResult(
+                doc_id=doc_id,
+                status="ignored_low_quality",
+                metadata={"reason": lq_reason}
             )
 
         # 2) 找到所有候选匹配
@@ -217,32 +231,60 @@ class TxtReportSplitter:
             metadata=meta
         )
 
-    def split_file(self, file_path: Path, output_dir: Optional[Path] = None) -> SplitResult:
-        """从文件读取并分割"""
+    def split_file(self, file_path: Path, output_dir: Optional[Path] = None,
+                   structured: bool = False) -> SplitResult:
+        """从文件读取并分割
+
+        Args:
+            file_path: 输入文件路径
+            output_dir: 输出目录
+            structured: 如果为True，按 {output_dir}/{doc_id}/{section}.txt 结构输出
+        """
         text = file_path.read_text(encoding='utf-8')
         doc_id = file_path.stem
         result = self.split(text, doc_id=doc_id)
 
         if output_dir:
             output_dir = Path(output_dir)
-            output_dir.mkdir(parents=True, exist_ok=True)
+            if structured:
+                # 结构化输出：每个报告一个子目录
+                doc_dir = output_dir / doc_id
+                doc_dir.mkdir(parents=True, exist_ok=True)
+                for sec_name, sec_text in result.sections.items():
+                    safe_name = sec_name.replace('、', '_').replace('/', '_')
+                    out_path = doc_dir / f"{safe_name}.txt"
+                    out_path.write_text(sec_text, encoding='utf-8')
 
-            for sec_name, sec_text in result.sections.items():
-                safe_name = sec_name.replace('、', '_').replace('/', '_')
-                out_path = output_dir / f"{doc_id}_{safe_name}.txt"
-                out_path.write_text(sec_text, encoding='utf-8')
+                meta_path = doc_dir / "_metadata.json"
+                meta_path.write_text(
+                    json.dumps({
+                        "doc_id": result.doc_id,
+                        "status": result.status,
+                        "metadata": result.metadata,
+                        "section_names": list(result.sections.keys()),
+                        "section_sizes": {k: len(v) for k, v in result.sections.items()},
+                    }, ensure_ascii=False, indent=2),
+                    encoding='utf-8'
+                )
+            else:
+                # 扁平输出：所有文件放在同一目录
+                output_dir.mkdir(parents=True, exist_ok=True)
+                for sec_name, sec_text in result.sections.items():
+                    safe_name = sec_name.replace('、', '_').replace('/', '_')
+                    out_path = output_dir / f"{doc_id}_{safe_name}.txt"
+                    out_path.write_text(sec_text, encoding='utf-8')
 
-            meta_path = output_dir / f"{doc_id}_metadata.json"
-            meta_path.write_text(
-                json.dumps({
-                    "doc_id": result.doc_id,
-                    "status": result.status,
-                    "metadata": result.metadata,
-                    "section_names": list(result.sections.keys()),
-                    "section_sizes": {k: len(v) for k, v in result.sections.items()},
-                }, ensure_ascii=False, indent=2),
-                encoding='utf-8'
-            )
+                meta_path = output_dir / f"{doc_id}_metadata.json"
+                meta_path.write_text(
+                    json.dumps({
+                        "doc_id": result.doc_id,
+                        "status": result.status,
+                        "metadata": result.metadata,
+                        "section_names": list(result.sections.keys()),
+                        "section_sizes": {k: len(v) for k, v in result.sections.items()},
+                    }, ensure_ascii=False, indent=2),
+                    encoding='utf-8'
+                )
 
         return result
 
@@ -253,6 +295,29 @@ class TxtReportSplitter:
         """检测是否为年度报告摘要"""
         first_lines = '\n'.join(text.split('\n')[:30])
         return "年度报告摘要" in first_lines
+
+    def _is_low_quality(self, text: str) -> Tuple[bool, str]:
+        """检测是否为低质量提取文本
+
+        Returns:
+            (is_low_quality, reason)
+        """
+        if len(text) == 0:
+            return True, "空文件（0字节）"
+        if len(text) < 500:
+            return True, f"文件过小（{len(text)}字节）"
+        # 检测 PDF 提取失败的 (cid:xxx) 标记：按比例而非绝对数量
+        cid_count = text.count('(cid:')
+        if cid_count > 0:
+            cid_ratio = cid_count / len(text)
+            if cid_ratio > 0.05:  # 超过5%的字符是(cid:)标记
+                return True, f"PDF提取失败标记过多（{cid_ratio:.1%}）"
+        # 检测中文比例极低（可能是严重乱码）
+        chinese = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+        total = len(text.replace(' ', '').replace('\n', ''))
+        if total > 0 and chinese / total < 0.15:
+            return True, f"中文比例过低（{chinese/total:.1%}），疑似严重乱码"
+        return False, ""
 
     def _find_all_matches(self, text: str) -> List[MatchRecord]:
         """在全文查找所有候选匹配"""
@@ -344,7 +409,7 @@ class TxtReportSplitter:
                 break
 
         if anchor_pos is None:
-            logger.warning("⚠️ 未找到任何锚点 (%s)，目录跳过可能不准确", "/".join(anchor_names))
+            logger.warning("未找到任何锚点 (%s)，目录跳过可能不准确", "/".join(anchor_names))
             return matches
 
         cutoff = anchor_pos + self.ANCHOR_OFFSET
@@ -353,8 +418,8 @@ class TxtReportSplitter:
         if anchor_match and anchor_match not in filtered:
             filtered.insert(0, anchor_match)
 
-        logger.info("📖 目录跳过: 锚点='%s' 位置=%d, 截断位置=%d, 保留 %d 个匹配",
-                    used_anchor, anchor_pos, cutoff, len(filtered))
+        logger.debug("目录跳过: 锚点='%s' 位置=%d, 截断位置=%d, 保留 %d 个匹配",
+                     used_anchor, anchor_pos, cutoff, len(filtered))
         return filtered
 
     def _dedup_and_sort(self, matches: List[MatchRecord]) -> List[MatchRecord]:
@@ -380,7 +445,7 @@ class TxtReportSplitter:
                 prev = matches[i - 1]
                 dist = m.start - prev.start
                 if dist < self.SUBSECTION_MERGE_DISTANCE:
-                    logger.debug("🔄 合并子section: '%s' (距 '%s' 仅 %d 字符)",
+                    logger.debug("合并子section: '%s' (距 '%s' 仅 %d 字符)",
                                  m.canonical_name, prev.canonical_name, dist)
                     continue
             result.append(m)
@@ -409,40 +474,15 @@ class TxtReportSplitter:
 
 
 # ============================================================
-# 批量处理入口
+# 批量处理
 # ============================================================
-def batch_split(input_dir: Path, output_dir: Path, pattern: str = "*.txt") -> Dict:
-    """批量处理目录下的TXT财报"""
-    splitter = TxtReportSplitter()
-    files = sorted(input_dir.glob(pattern))
-
-    summary = {
-        "total_files": len(files),
-        "success": 0,
-        "warning": 0,
-        "failed": 0,
-        "ignored_summary": 0,
-        "details": [],
-    }
-
-    for file_path in files:
-        doc_id = file_path.stem
-        logger.info("=" * 60)
-        logger.info("📄 处理: %s", doc_id)
-
-        try:
-            result = splitter.split_file(file_path, output_dir)
-        except Exception as e:
-            logger.exception("❌ 处理失败: %s", doc_id)
-            summary["failed"] += 1
-            summary["details"].append({
-                "doc_id": doc_id,
-                "status": "failed",
-                "error": str(e),
-            })
-            continue
-
-        summary[result.status] = summary.get(result.status, 0) + 1
+def _process_one_file(args: Tuple[Path, Path, bool, bool]) -> Dict:
+    """Worker function for parallel processing"""
+    file_path, output_dir, structured, quiet = args
+    doc_id = file_path.stem
+    try:
+        splitter = TxtReportSplitter()
+        result = splitter.split_file(file_path, output_dir, structured=structured)
         detail = {
             "doc_id": doc_id,
             "status": result.status,
@@ -453,23 +493,133 @@ def batch_split(input_dir: Path, output_dir: Path, pattern: str = "*.txt") -> Di
             detail["warnings"] = result.metadata.get("warning", "")
         if result.status == "failed":
             detail["error"] = result.metadata.get("error", "")
-        summary["details"].append(detail)
+        if result.status in ("ignored_summary", "ignored_low_quality"):
+            detail["reason"] = result.metadata.get("reason", "")
+        return detail
+    except Exception as e:
+        return {
+            "doc_id": doc_id,
+            "status": "failed",
+            "error": str(e),
+        }
 
-        logger.info("📊 状态: %s", result.status)
-        for name, size in detail["section_sizes"].items():
-            flag = " 🚨" if size == 0 else ""
-            logger.info("   %s: %d 字符%s", name, size, flag)
+
+def batch_split(input_dir: Path, output_dir: Path, pattern: str = "*.txt",
+                workers: int = 1, structured: bool = False, quiet: bool = False) -> Dict:
+    """批量处理目录下的TXT财报
+
+    Args:
+        input_dir: 输入目录
+        output_dir: 输出目录
+        pattern: 文件匹配模式
+        workers: 并行进程数，>1 启用多进程
+        structured: 是否按结构化目录输出
+        quiet: 安静模式，减少日志输出
+    """
+    files = sorted(input_dir.glob(pattern))
+    total = len(files)
+
+    summary = {
+        "total_files": total,
+        "success": 0,
+        "warning": 0,
+        "failed": 0,
+        "ignored_summary": 0,
+        "elapsed_seconds": 0,
+        "details": [],
+    }
+
+    start_time = time.time()
+    logger.info("=" * 60)
+    logger.info("批量处理开始: %d 个文件", total)
+    logger.info("输出目录: %s", output_dir)
+    logger.info("并行进程: %d", workers)
+    logger.info("结构化输出: %s", structured)
+    logger.info("=" * 60)
+
+    if workers > 1:
+        # 多进程模式
+        args_list = [(f, output_dir, structured, quiet) for f in files]
+        completed = 0
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_process_one_file, arg): arg[0] for arg in args_list}
+            for future in as_completed(futures):
+                detail = future.result()
+                summary["details"].append(detail)
+                summary[detail["status"]] = summary.get(detail["status"], 0) + 1
+                completed += 1
+                if not quiet and completed % 100 == 0:
+                    elapsed = time.time() - start_time
+                    speed = completed / elapsed if elapsed > 0 else 0
+                    logger.info("进度: %d/%d (%.1f%%) | 速度: %.1f 文件/秒 | 成功:%d 警告:%d 失败:%d 忽略:%d",
+                                completed, total, completed / total * 100, speed,
+                                summary.get("success", 0),
+                                summary.get("warning", 0),
+                                summary.get("failed", 0),
+                                summary.get("ignored_summary", 0))
+    else:
+        # 单进程模式
+        splitter = TxtReportSplitter()
+        for idx, file_path in enumerate(files, 1):
+            doc_id = file_path.stem
+            if not quiet:
+                logger.info("[%d/%d] %s", idx, total, doc_id)
+
+            try:
+                result = splitter.split_file(file_path, output_dir, structured=structured)
+            except Exception as e:
+                logger.exception("处理失败: %s", doc_id)
+                summary["failed"] += 1
+                summary["details"].append({
+                    "doc_id": doc_id,
+                    "status": "failed",
+                    "error": str(e),
+                })
+                continue
+
+            summary[result.status] = summary.get(result.status, 0) + 1
+            detail = {
+                "doc_id": doc_id,
+                "status": result.status,
+                "sections": list(result.sections.keys()),
+                "section_sizes": {k: len(v) for k, v in result.sections.items()},
+            }
+            if result.status == "warning":
+                detail["warnings"] = result.metadata.get("warning", "")
+            if result.status == "failed":
+                detail["error"] = result.metadata.get("error", "")
+            summary["details"].append(detail)
+
+            if not quiet and idx % 100 == 0:
+                elapsed = time.time() - start_time
+                speed = idx / elapsed if elapsed > 0 else 0
+                logger.info("进度: %d/%d (%.1f%%) | 速度: %.1f 文件/秒 | 成功:%d 警告:%d 失败:%d 忽略:%d",
+                            idx, total, idx / total * 100, speed,
+                            summary.get("success", 0),
+                            summary.get("warning", 0),
+                            summary.get("failed", 0),
+                            summary.get("ignored_summary", 0))
+
+    elapsed = time.time() - start_time
+    summary["elapsed_seconds"] = round(elapsed, 2)
+
+    # 按状态排序 details，失败/警告的放在前面便于查看
+    summary["details"].sort(key=lambda d: {"failed": 0, "warning": 1, "success": 2, "ignored_summary": 3}.get(d["status"], 4))
 
     report_path = output_dir / "_batch_report.json"
     report_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+
     logger.info("=" * 60)
-    logger.info("📋 批量报告已保存: %s", report_path)
+    logger.info("批量处理完成")
+    logger.info("耗时: %.2f 秒", elapsed)
     logger.info("总计: %d, 成功: %d, 警告: %d, 失败: %d, 摘要忽略: %d",
-                summary["total_files"],
+                total,
                 summary.get("success", 0),
                 summary.get("warning", 0),
                 summary.get("failed", 0),
                 summary.get("ignored_summary", 0))
+    logger.info("报告已保存: %s", report_path)
+    logger.info("=" * 60)
 
     return summary
 
@@ -489,12 +639,23 @@ if __name__ == "__main__":
                         help="文件匹配模式 (默认: *.txt)")
     parser.add_argument("--file", type=Path, default=None,
                         help="单文件处理模式")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="并行进程数，>1 启用多进程 (默认: 1)")
+    parser.add_argument("--structured", action="store_true",
+                        help="按结构化目录输出: {output_dir}/{doc_id}/{section}.txt")
+    parser.add_argument("--quiet", action="store_true",
+                        help="安静模式，减少日志输出")
 
     args = parser.parse_args()
 
+    if args.quiet:
+        logger.setLevel(logging.WARNING)
+        # 也降低根日志级别
+        logging.getLogger().setLevel(logging.WARNING)
+
     if args.file:
         splitter = TxtReportSplitter()
-        result = splitter.split_file(args.file, args.output_dir)
+        result = splitter.split_file(args.file, args.output_dir, structured=args.structured)
         print(json.dumps({
             "doc_id": result.doc_id,
             "status": result.status,
@@ -503,4 +664,5 @@ if __name__ == "__main__":
             "metadata": result.metadata,
         }, ensure_ascii=False, indent=2))
     else:
-        batch_split(args.input_dir, args.output_dir, args.pattern)
+        batch_split(args.input_dir, args.output_dir, args.pattern,
+                    workers=args.workers, structured=args.structured, quiet=args.quiet)
