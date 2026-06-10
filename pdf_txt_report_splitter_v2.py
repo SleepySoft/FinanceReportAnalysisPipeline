@@ -142,12 +142,6 @@ class TxtReportSplitter:
             "審計報告",
             "獨立核數師報告",
         ]),
-        SectionDef("公司基本情况", [
-            "公司基本情况",
-            "公司基本情況",
-            "本公司基本情况",
-            "本公司基本情況",
-        ]),
         SectionDef("关联方及关联交易", [
             "关联方及关联交易",
             "關聯方及關聯交易",
@@ -185,8 +179,8 @@ class TxtReportSplitter:
         "股份变动及股东情况": 70,
         "债券相关情况": 80,
         "财务报告": 90,
-        "审计报告": 100,
-        "公司基本情况": 105,
+        "审计报告": 90,       # 与 090 同 order：金融类年报常见审计报告在财务报表之前
+        "公司基本情况": 999,  # 放到最后作为补充，避免正文子章节污染顺序表
         "关联方及关联交易": 110,
         "重要交易和事项": 120,
     }
@@ -252,11 +246,11 @@ class TxtReportSplitter:
     ENABLE_SUBSECTION_MERGE = False
     SUBSECTION_MERGE_DISTANCE = 800
 
-    # 通用节编号前缀正则
+    # 通用节编号前缀正则（注意：\s 不包含换行，避免跨行误匹配）
     SECTION_PREFIX_RE = (
         r"(?:第[一二三四五六七八九十0-9]+(?:节|章)|"
         r"[（(][一二三四五六七八九十0-9]+[)）]|"
-        r"[一二三四五六七八九十0-9]+[、.．])\s*"
+        r"[一二三四五六七八九十0-9]+[、.．])[ \t]*"
     )
 
     def __init__(self):
@@ -276,7 +270,7 @@ class TxtReportSplitter:
         chars = [c for c in alias if not c.isspace()]
         if not chars:
             return ""
-        body = r"".join(re.escape(c) + r"\s*" for c in chars).rstrip(r"\s*")
+        body = r"".join(re.escape(c) + r"[ \t]*" for c in chars).rstrip(r"[ \t]*")
         return body
 
     def _compile_patterns(self):
@@ -369,28 +363,27 @@ class TxtReportSplitter:
 
         rejected_candidates = []
 
-        # 3. 主流程：强匹配 + 严格弱匹配
+        # 3. 主流程：强匹配 + 弱匹配收集
         primary_matches = self._find_primary_matches(text)
 
         # 4. 目录跳过
         filtered_matches = self._skip_toc(primary_matches, text)
 
-        # 5. 顺序接纳：只补缺、不覆盖、顺序不能倒置
-        accepted, rejected = self._select_ordered_boundaries(filtered_matches)
+        # 5. 阶段1：强匹配（tier=1）建立可信定位表
+        # 强约束为一等公民：先跑强匹配，独占 slot，弱匹配不能抢
+        strong_matches = [m for m in filtered_matches if m.tier == 1]
+        accepted, rejected = self._select_ordered_boundaries(strong_matches)
         rejected_candidates.extend(rejected)
 
-        # 6. 可选：老的子章节合并，默认关闭
-        if self.ENABLE_SUBSECTION_MERGE:
-            accepted = self._merge_subsections(accepted)
-
-        # 7. fallback：仅针对缺失项
-        missing_before_fallback = self._find_missing_sections(accepted)
-        fallback_matches = self._find_fallback_matches(
-            text=text,
-            missing_sections=missing_before_fallback,
-        )
-
-        for m in sorted(fallback_matches, key=lambda x: x.start):
+        # 6. 阶段2：弱匹配（tier=2）只补缺，不覆盖已有章节
+        weak_matches = [m for m in filtered_matches if m.tier == 2]
+        for m in sorted(weak_matches, key=lambda x: (x.start, -len(x.matched_alias))):
+            # 只补缺：该章节已有强匹配，弱匹配直接跳过
+            if any(a.canonical_name == m.canonical_name for a in accepted):
+                rejected_candidates.append(
+                    self._rejected_dict(m, "weak_match_after_strong_exists")
+                )
+                continue
             ok, reason = self._can_accept_boundary(m, accepted)
             if ok:
                 accepted.append(m)
@@ -398,7 +391,37 @@ class TxtReportSplitter:
             else:
                 rejected_candidates.append(self._rejected_dict(m, reason))
 
-        # 8. 最终切分点表
+        # 7. 可选：子章节合并
+        if self.ENABLE_SUBSECTION_MERGE:
+            accepted = self._merge_subsections(accepted)
+
+        # 8. fallback：仅针对缺失项
+        missing_before_fallback = self._find_missing_sections(accepted)
+        fallback_matches = self._find_fallback_matches(
+            text=text,
+            missing_sections=missing_before_fallback,
+        )
+
+        for m in sorted(fallback_matches, key=lambda x: x.start):
+            # fallback 同样只补缺
+            if any(a.canonical_name == m.canonical_name for a in accepted):
+                rejected_candidates.append(
+                    self._rejected_dict(m, "fallback_after_exists")
+                )
+                continue
+            ok, reason = self._can_accept_boundary(m, accepted)
+            if ok:
+                accepted.append(m)
+                accepted.sort(key=lambda x: x.start)
+            else:
+                rejected_candidates.append(self._rejected_dict(m, reason))
+
+        # 9. 后处理：若 审计报告 紧邻 财务报告（<500字符），视为财务报告的子章节，
+        # 避免把 090 切成只有标题的薄片。
+        accepted, extra_rejected = self._merge_adjacent_audit_report(accepted)
+        rejected_candidates.extend(extra_rejected)
+
+        # 10. 最终切分点表
         final_matches = sorted(accepted, key=lambda m: m.start)
 
         # 9. 分割
@@ -632,6 +655,12 @@ class TxtReportSplitter:
                 if weak_count >= self.WEAK_MATCH_LIMIT_PER_SECTION:
                     break
 
+        # 过滤封面/目录区域的短弱匹配，避免污染顺序定位表
+        records = [
+            r for r in records
+            if not (r.tier >= 2 and r.start < 1000 and len(r.line_text.strip()) <= 6)
+        ]
+
         return records
 
     def _make_match_record(
@@ -760,6 +789,11 @@ class TxtReportSplitter:
         if dot_like > 5:
             return False
 
+        # 1b. 目录条目/路径过滤：含有层级分隔符的整行多为目录路径
+        # 例如 "节 财务报告/十四、关联方及关联交易/5、关联交易情况"
+        if line.count("/") >= 2 or line.count("-") >= 3 or line.count("—") >= 2:
+            return False
+
         # 2. 页码过滤
         after = after_text.strip()
         if re.match(r"^\d+$", after):
@@ -767,6 +801,10 @@ class TxtReportSplitter:
 
         # 3. 目录页码格式
         if re.search(r"\s{5,}\d+$", line):
+            return False
+
+        # 3b. 目录条目：页码在前，如 "120 财务报告" / "7 公司简介"
+        if re.match(r"^\d+\s+", line):
             return False
 
         # 4. 引用检测
@@ -835,9 +873,11 @@ class TxtReportSplitter:
         sorted_matches = sorted(matches, key=lambda m: m.start)
 
         for name in anchor_names:
+            # 忽略封面/目录区域的弱匹配锚点，避免过早截断导致目录条目残留
             anchor_matches = [
                 m for m in sorted_matches
                 if m.canonical_name == name
+                and (m.start >= 1000 or m.tier == 1)
             ]
             if anchor_matches:
                 anchor_pos = anchor_matches[0].start
@@ -853,6 +893,21 @@ class TxtReportSplitter:
 
         cutoff = anchor_pos + self.ANCHOR_OFFSET
         filtered = [m for m in matches if m.start >= cutoff]
+
+        # 智能 reinject：如果正文中没有同名的强匹配锚点，reinject 目录锚点保底
+        anchor_strong_in_body = any(
+            m.canonical_name == used_anchor and m.tier == 1
+            for m in filtered
+        )
+        anchor_match = next(
+            (m for m in matches if m.canonical_name == used_anchor), None
+        )
+        if anchor_match and not anchor_strong_in_body:
+            filtered.insert(0, anchor_match)
+            logger.debug(
+                "目录跳过+锚点保底: 锚点='%s' 正文无强匹配，reinject 目录锚点",
+                used_anchor,
+            )
 
         logger.debug(
             "目录跳过: 锚点='%s' 位置=%d, 截断位置=%d, 保留 %d 个匹配",
@@ -903,6 +958,41 @@ class TxtReportSplitter:
                 rejected.append(self._rejected_dict(m, reason))
 
         return accepted, rejected
+
+    def _merge_adjacent_audit_report(
+        self,
+        accepted: List[MatchRecord],
+    ) -> Tuple[List[MatchRecord], List[Dict]]:
+        """若审计报告与财务报告间距过小，合并到财务报告中。"""
+        PROXIMITY = 500
+        extra: List[Dict] = []
+        result: List[MatchRecord] = []
+
+        sorted_acc = sorted(accepted, key=lambda m: m.start)
+        skip_names: set = set()
+
+        for i, m in enumerate(sorted_acc):
+            if m.canonical_name == "审计报告":
+                # 找相邻的财务报告
+                prev_match = sorted_acc[i - 1] if i > 0 else None
+                next_match = sorted_acc[i + 1] if i + 1 < len(sorted_acc) else None
+                partner = None
+                if prev_match and prev_match.canonical_name == "财务报告" \
+                        and m.start - prev_match.start < PROXIMITY:
+                    partner = prev_match
+                elif next_match and next_match.canonical_name == "财务报告" \
+                        and next_match.start - m.start < PROXIMITY:
+                    partner = next_match
+                if partner is not None:
+                    extra.append(
+                        self._rejected_dict(m, "merged_into_adjacent_财务报告")
+                    )
+                    skip_names.add(id(m))
+                    continue
+            if id(m) not in skip_names:
+                result.append(m)
+
+        return result, extra
 
     def _can_accept_boundary(
         self,
