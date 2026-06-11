@@ -216,3 +216,18 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project-specific data directories
+output/
+full/
+.idea/
+
+# Old versions and temporary scripts
+pdf_txt_report_splitter_v1.py
+run_v2_direct.py
+run_v2_batched.py
+run_full_batched.py
+compare_v1_v2.py
+test_v2_import.py
+test_v2_improved.py
+patch_missing_dirs.py

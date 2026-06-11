@@ -1011,10 +1011,10 @@ class TxtReportSplitter:
             return False, "duplicate_section_not_overwrite"
 
         candidate_order = self.SECTION_ORDER_MAP.get(candidate.canonical_name)
-        if candidate_order is None:
-            return False, "unknown_section_order"
 
         # 2. 插入后顺序校验
+        # 对于无 order 的 section（如 appendix 章节），不参与顺序校验，
+        # 避免它们阻塞正常章节。
         test = sorted(accepted + [candidate], key=lambda m: m.start)
 
         prev_order = None
@@ -1023,7 +1023,8 @@ class TxtReportSplitter:
         for m in test:
             order = self.SECTION_ORDER_MAP.get(m.canonical_name)
             if order is None:
-                return False, f"unknown_section_order:{m.canonical_name}"
+                # appendix 类章节不参与顺序倒置校验
+                continue
 
             if prev_order is not None and order < prev_order:
                 return (
