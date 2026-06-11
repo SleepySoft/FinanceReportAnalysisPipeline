@@ -4,7 +4,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from pdf_txt_report_splitter_v2 import TxtReportSplitter
+from pdf_txt_report_splitter import TxtReportSplitter
 
 INPUT_DIR = Path("full")
 OUTPUT_DIR = Path("output/full_split_v3")
