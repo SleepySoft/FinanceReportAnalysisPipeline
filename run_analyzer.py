@@ -34,6 +34,10 @@ LOCAL_SPLIT_DIR = Path("output/full_split_v3")
 # OpenClaw Gateway 在 WSL 中看到的分割结果目录
 WSL_SPLIT_DIR = "/mnt/d/FinanceReportAnalysisPipeline/output/full_split_v3"
 
+# OpenClaw Gateway host（WSL 中访问 Windows host 需用 10.255.255.254 等实际 IP）
+OPENCLAW_HOST = os.environ.get("OPENCLAW_HOST", "127.0.0.1")
+OPENCLAW_PORT = int(os.environ.get("OPENCLAW_PORT", "18789"))
+
 # 本地输出目录
 LOCAL_OUTPUT_DIR = Path("output/analysis_v3")
 
@@ -447,7 +451,12 @@ async def main():
     args.token = token
 
     if args.doc_id:
-        async with OpenClawAsyncClient(token=args.token, timeout=AGENT_TIMEOUT) as client:
+        async with OpenClawAsyncClient(
+            token=args.token,
+            timeout=AGENT_TIMEOUT,
+            host=OPENCLAW_HOST,
+            port=OPENCLAW_PORT,
+        ) as client:
             await run_single(client, args.doc_id, args)
     else:
         await run_batch(args)
