@@ -213,6 +213,8 @@ async def analyze_one(
     prompt_text: str,
     max_retries: int = MAX_RETRIES,
 ) -> Dict:
+    print(f"Analysing {doc_id} in {wsl_doc_dir} -> {output_path}")
+
     """分析单个文档，支持重试。"""
     message = build_message(doc_id, wsl_doc_dir, str(output_path))
 
@@ -345,8 +347,8 @@ async def run_batch(args) -> Dict:
         d.name for d in input_dir.iterdir()
         if d.is_dir() and not d.name.startswith("_")
     ])
-    if args.limit:
-        doc_ids = doc_ids[:args.limit]
+    # if args.limit:
+    #     doc_ids = doc_ids[:args.limit]
     total = len(doc_ids)
 
     progress_path = output_dir / "_progress.json"
@@ -360,6 +362,12 @@ async def run_batch(args) -> Dict:
         details = []
         print(f"analyze start: {total} docs")
 
+    print('--------------------- doc ids ---------------------')
+    print(doc_ids)
+    print('------------------ processed ids ------------------')
+    print(processed)
+    print('---------------------------------------------------')
+
     start_time = time.time()
 
     async with OpenClawAsyncClient(
@@ -372,6 +380,7 @@ async def run_batch(args) -> Dict:
         async def wrapped(doc_id: str):
             async with semaphore:
                 if doc_id in processed:
+                    print(f"doc_id {doc_id} is in processed.")
                     return None
                 wsl_doc_dir = f"{WSL_SPLIT_DIR}/{doc_id}"
                 output_path = output_dir / f"{doc_id}.json"
@@ -385,16 +394,24 @@ async def run_batch(args) -> Dict:
 
         tasks = [asyncio.create_task(wrapped(d)) for d in doc_ids]
 
+        print(f"Task count: {len(tasks)}")
+
         completed = 0
         for coro in asyncio.as_completed(tasks):
             result = await coro
             if result is None:
+                print('Result is None.')
                 continue
 
             details.append(result)
             if result["status"] == "success":
                 processed.add(result["doc_id"])
             completed += 1
+
+            if args.limit:
+                if completed >= args.limit:
+                    print(f"Limit {args.limit} reached. Quit.")
+                    break
 
             if completed % BATCH_SIZE == 0:
                 progress_path.write_text(
